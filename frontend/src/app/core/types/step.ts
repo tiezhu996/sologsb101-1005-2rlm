@@ -61,12 +61,18 @@ export interface StepView extends Step {
   bridgeName: string;
   /** 本步及之前步骤的累计目标顶升量（mm） */
   cumulativeLiftMm: number;
-  /** 累计顶升量与限位值的关系 */
+  /** 本步实测顶升量（mm）：取该步最后一轮正式读数的平均位移；无读数为 null */
+  measuredLiftMm: number | null;
+  /** 截至本步的累计实测顶升量（mm）；任一无读数为 null（正式读数确认后重算） */
+  measuredCumulativeLiftMm: number | null;
+  /** 累计顶升量与限位值的关系（实测口径优先，无实测时按目标口径） */
   overLimit: boolean;
   /** 该步骤的测点读数条数 */
   readingCount: number;
   /** 同步偏差（mm），无读数为 null */
   syncDeviationMm: number | null;
+  /** 超限告警读数条数（位移超限位或应力超关注值） */
+  alertCount: number;
   /** 校验结论文案 */
   validation: string;
 }
@@ -74,6 +80,26 @@ export interface StepView extends Step {
 /** 步骤排序 */
 export function sortSteps<T extends { seq: number }>(rows: T[]): T[] {
   return [...rows].sort((a, b) => a.seq - b.seq);
+}
+
+/**
+ * 单步实测顶升量（mm）：以记录时间最晚的一轮读数的平均位移为准；
+ * 同一 recordedAt 视为同一轮（四角同步记录）。无读数返回 null。
+ */
+export function measuredLiftOfStep(
+  rows: Array<{ recordedAt: string; displacementMm: number }>,
+): number | null {
+  if (rows.length === 0) return null;
+  const rounds = new Map<string, Array<{ displacementMm: number }>>();
+  for (const row of rows) {
+    const list = rounds.get(row.recordedAt) ?? [];
+    list.push({ displacementMm: row.displacementMm });
+    rounds.set(row.recordedAt, list);
+  }
+  const latestTime = [...rounds.keys()].sort((a, b) => b.localeCompare(a))[0];
+  const latest = rounds.get(latestTime) ?? [];
+  const avg = latest.reduce((sum, item) => sum + item.displacementMm, 0) / latest.length;
+  return Number(avg.toFixed(2));
 }
 
 /** 重排序号：按给定 id 顺序重编号，返回新行 */

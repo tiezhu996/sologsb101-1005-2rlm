@@ -34,8 +34,9 @@ export function mpaToKn(mpa: number, areaCm2: number): number {
   return Number(((mpa * areaMm2) / 1000).toFixed(2));
 }
 
-/** 应力格式化 */
-export function formatStress(mpa: number): string {
+/** 应力格式化（旧数据缺应力字段时显示「未测」） */
+export function formatStress(mpa: number | null | undefined): string {
+  if (mpa === null || mpa === undefined || Number.isNaN(mpa)) return '未测';
   if (Math.abs(mpa) >= 100) return `${mpa.toFixed(0)} MPa`;
   return `${mpa.toFixed(2)} MPa`;
 }

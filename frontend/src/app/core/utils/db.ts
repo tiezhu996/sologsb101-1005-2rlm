@@ -12,13 +12,14 @@ import type { Bearing, DiseaseGrade } from '../types/bearing';
 import type { Step, SyncRequirement } from '../types/step';
 import type { Reading } from '../types/reading';
 import type { Acceptance, AcceptanceStage } from '../types/acceptance';
+import type { ImportJob, PendingReading } from '../types/merge';
 import { ROW_REVISION, type Revisioned } from '../types/persistence';
 
 /** 浏览器 IndexedDB 库名 */
 export const DB_NAME = 'gbbridgebear';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -29,6 +30,8 @@ export type BearingRow = Bearing;
 export type StepRow = Step;
 export type ReadingRow = Reading;
 export type AcceptanceRow = Acceptance;
+export type PendingReadingRow = PendingReading;
+export type ImportJobRow = ImportJob;
 
 class BridgeBearingDatabase extends Dexie {
   bridges!: Table<BridgeRow, string>;
@@ -38,6 +41,10 @@ class BridgeBearingDatabase extends Dexie {
   readings!: Table<ReadingRow, string>;
   acceptances!: Table<AcceptanceRow, string>;
   settings!: Table<{ id: string; value: string; updatedAt: string }, string>;
+  /** 离线合并：暂存读数（逐项确认前不进入正式 readings） */
+  pendingReadings!: Table<PendingReadingRow, string>;
+  /** 离线合并：导入任务与写入检查点 */
+  importJobs!: Table<ImportJobRow, string>;
 
   constructor() {
     super(DB_NAME);
@@ -99,6 +106,34 @@ class BridgeBearingDatabase extends Dexie {
           if (typeof row.limitMm !== 'number' && typeof row.limit === 'number') row.limitMm = row.limit;
           if (typeof row.targetLiftMm !== 'number' && typeof row.lift === 'number') row.targetLiftMm = row.lift;
         });
+      });
+
+    // v3：离线整库合并——新增暂存读数表与导入任务（检查点）表；
+    //     readings.stressMpa 对旧数据缺字段时按 null（缺测）兼容
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        bridges: 'id, name, bridgeType, builtYear, roadClass, archived',
+        piers: 'id, bridgeId, code, capElevation, [bridgeId+code]',
+        bearings: 'id, pierId, diseaseGrade, type, serial, [pierId+serial]',
+        steps: 'id, bridgeId, seq, state, syncRequirement, [bridgeId+seq]',
+        readings: 'id, stepId, pointCode, recordedAt, [stepId+pointCode]',
+        acceptances: 'id, bearingId, stage, conclusion, [bearingId+stage]',
+        settings: 'id',
+        pendingReadings: 'id, jobId, packageHash, resolvedStepId, status, [jobId+ordinal], [resolvedStepId+pointCode]',
+        importJobs: 'id, packageHash, state, phase, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        // 兼容旧记录：缺少应力字段时标记缺测（null），统计告警只按位移判定
+        await tx
+          .table('readings')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            const stress = row['stressMpa'];
+            if (stress === null || stress === undefined || stress === '' || Number.isNaN(Number(stress))) {
+              row.stressMpa = null;
+              row.stressMissing = true;
+            }
+          });
       });
   }
 }
@@ -455,8 +490,18 @@ export async function removeStep(id: string): Promise<void> {
 
 /* ============================ 测点读数 ============================ */
 
+/** 读取兼容：旧数据包 / 历史行可能缺少应力字段，统一按 null（缺测）处理 */
+function normalizeReading(row: ReadingRow): ReadingRow {
+  const stress: unknown = (row as { stressMpa?: unknown }).stressMpa;
+  if (stress === null || stress === undefined || Number.isNaN(Number(stress))) {
+    return { ...row, stressMpa: null, stressMissing: true };
+  }
+  return row;
+}
+
 export async function listReadings(): Promise<ReadingRow[]> {
-  return db.readings.toArray();
+  const rows = await db.readings.toArray();
+  return rows.map(normalizeReading);
 }
 
 export async function putReading(row: ReadingRow): Promise<void> {
@@ -464,7 +509,7 @@ export async function putReading(row: ReadingRow): Promise<void> {
 }
 
 export async function putReadings(rows: ReadingRow[]): Promise<void> {
-  await db.readings.bulkPut(rows);
+  await db.readings.bulkPut(rows.map(normalizeReading));
 }
 
 export async function removeReading(id: string): Promise<void> {
@@ -483,6 +528,52 @@ export async function putAcceptance(row: AcceptanceRow): Promise<void> {
 
 export async function removeAcceptance(id: string): Promise<void> {
   await db.acceptances.delete(id);
+}
+
+/* ======================= 离线合并：暂存与检查点 ======================= */
+
+export async function listPendingReadings(): Promise<PendingReadingRow[]> {
+  const rows = await db.pendingReadings.toArray();
+  return rows.sort((a, b) => a.ordinal - b.ordinal);
+}
+
+export async function listPendingByJob(jobId: string): Promise<PendingReadingRow[]> {
+  const rows = await db.pendingReadings.where('jobId').equals(jobId).toArray();
+  return rows.sort((a, b) => a.ordinal - b.ordinal);
+}
+
+export async function putPendingReadings(rows: PendingReadingRow[]): Promise<void> {
+  await db.pendingReadings.bulkPut(rows);
+}
+
+export async function getPendingReadings(ids: string[]): Promise<PendingReadingRow[]> {
+  if (ids.length === 0) return [];
+  return db.pendingReadings.where('id').anyOf(ids).toArray();
+}
+
+export async function deletePendingReadings(ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  await db.pendingReadings.where('id').anyOf(ids).delete();
+}
+
+export async function listImportJobs(): Promise<ImportJobRow[]> {
+  const rows = await db.importJobs.toArray();
+  return rows.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+export async function getImportJob(id: string): Promise<ImportJobRow | undefined> {
+  return db.importJobs.get(id);
+}
+
+export async function putImportJob(row: ImportJobRow): Promise<void> {
+  await db.importJobs.put(row);
+}
+
+export async function removeImportJob(id: string): Promise<void> {
+  await db.transaction('rw', [db.importJobs, db.pendingReadings], async () => {
+    await db.pendingReadings.where('jobId').equals(id).delete();
+    await db.importJobs.delete(id);
+  });
 }
 
 /* ========================== 整库导入导出 ========================== */
@@ -538,7 +629,15 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
       await db.piers.bulkPut(snapshot.piers ?? []);
       await db.bearings.bulkPut(snapshot.bearings ?? []);
       await db.steps.bulkPut(snapshot.steps ?? []);
-      await db.readings.bulkPut(snapshot.readings ?? []);
+      // 兼容旧整库备份：读数缺少应力字段时按缺测读入，不阻断导入
+      const readings = (snapshot.readings ?? []).map((row) => {
+        const stress: unknown = (row as { stressMpa?: unknown }).stressMpa;
+        if (stress === null || stress === undefined || stress === '' || Number.isNaN(Number(stress))) {
+          return { ...row, stressMpa: null, stressMissing: true } as ReadingRow;
+        }
+        return { ...row, stressMpa: Number(stress) } as ReadingRow;
+      });
+      await db.readings.bulkPut(readings);
       await db.acceptances.bulkPut(snapshot.acceptances ?? []);
     },
   );
@@ -565,15 +664,17 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [bridges, piers, bearings, steps, readings, acceptances] = await Promise.all([
+  const [bridges, piers, bearings, steps, readings, acceptances, pendingReadings, importJobs] = await Promise.all([
     db.bridges.count(),
     db.piers.count(),
     db.bearings.count(),
     db.steps.count(),
     db.readings.count(),
     db.acceptances.count(),
+    db.pendingReadings.count(),
+    db.importJobs.count(),
   ]);
-  return { bridges, piers, bearings, steps, readings, acceptances };
+  return { bridges, piers, bearings, steps, readings, acceptances, pendingReadings, importJobs };
 }
 
 /** 结构版本信息 */

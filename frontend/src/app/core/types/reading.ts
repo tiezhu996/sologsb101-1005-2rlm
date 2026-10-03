@@ -9,8 +9,14 @@ export interface Reading extends RowMeta {
   pointCode: string;
   /** 位移（mm） */
   displacementMm: number;
-  /** 应力（MPa） */
-  stressMpa: number;
+  /**
+   * 应力（MPa）。
+   * 兼容旧设备数据包：历史记录可能没有应力字段，读取时以 null 表示缺测，
+   * 统计与告警按仅位移口径降级处理（见 utils/tolerance.ts）。
+   */
+  stressMpa: number | null;
+  /** 该行是否由缺少应力字段的旧数据兼容读入 */
+  stressMissing?: boolean;
   /** 记录时间 yyyy-MM-dd HH:mm */
   recordedAt: string;
   /** 记录人 */
@@ -22,7 +28,7 @@ export interface ReadingDraft {
   stepId: string;
   pointCode: string;
   displacementMm: number;
-  stressMpa: number;
+  stressMpa: number | null;
   recordedAt: string;
   operator: string;
 }
@@ -45,7 +51,7 @@ export interface ReadingView extends Reading {
 export interface ReadingBatchRow {
   pointCode: string;
   displacementMm: number;
-  stressMpa: number;
+  stressMpa: number | null;
 }
 
 /** 测点编号建议：按同步要求给出四角测点 */

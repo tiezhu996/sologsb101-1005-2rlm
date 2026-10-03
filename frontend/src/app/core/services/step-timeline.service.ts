@@ -8,7 +8,7 @@ import { Observable, combineLatest, map, shareReplay } from 'rxjs';
 import { IdbTableService } from './idb-table.service';
 import { listBearings, listBridges, listReadings, listSteps } from '../utils/db';
 import type { BridgeRow, BearingRow, ReadingRow, StepRow } from '../utils/db';
-import { sortSteps, SYNC_REQUIREMENT_LABEL, type StepView } from '../types/step';
+import { sortSteps, SYNC_REQUIREMENT_LABEL, measuredLiftOfStep, type StepView } from '../types/step';
 import { meanDisplacement, syncDeviationMm, type ReadingView } from '../types/reading';
 import { overallLevel, syncLevel, type ToleranceLevel } from '../utils/tolerance';
 
@@ -139,30 +139,43 @@ export class StepTimelineService {
     shareReplay({ bufferSize: 1, refCount: true }),
   );
 
-  /** 构建步骤视图（供派生流与页面共用） */
+  /** 构建步骤视图（供派生流与页面共用），按桥梁分别累计目标 / 实测顶升量 */
   buildStepViews(snapshot: StepTimelineSnapshot): StepView[] {
     const bridgeName = new Map(snapshot.bridges.map((item) => [item.id, item.name]));
     const ordered = sortSteps(snapshot.steps);
-    const cumulative = new Map<string, number>();
-    let running = 0;
-    for (const step of ordered) {
-      running += step.targetLiftMm;
-      cumulative.set(step.id, Number(running.toFixed(2)));
-    }
+    const targetRun = new Map<string, number>();
+    const measuredRun = new Map<string, number>();
     return ordered.map((step) => {
       const rows = snapshot.readings.filter((item) => item.stepId === step.id);
-      const cumulativeLiftMm = cumulative.get(step.id) ?? step.targetLiftMm;
+      const targetTotal = (targetRun.get(step.bridgeId) ?? 0) + step.targetLiftMm;
+      targetRun.set(step.bridgeId, targetTotal);
+      const cumulativeLiftMm = Number(targetTotal.toFixed(2));
+
+      const measured = measuredLiftOfStep(rows);
+      let measuredCumulative: number | null = null;
+      if (measured !== null) {
+        measuredCumulative = measuredRun.has(step.bridgeId)
+          ? Number(((measuredRun.get(step.bridgeId) ?? 0) + measured).toFixed(2))
+          : measured;
+        measuredRun.set(step.bridgeId, measuredCumulative);
+      }
+
       const deviation = rows.length > 0 ? syncDeviationMm(rows) : null;
-      const overLimit = cumulativeLiftMm > step.limitMm;
+      const referenceCumulative = measuredCumulative ?? cumulativeLiftMm;
+      const overLimit = referenceCumulative > step.limitMm;
+      const alertCount = rows.filter((row) => overallLevel(row.displacementMm, step.limitMm, row.stressMpa) === 'exceed').length;
       return {
         ...step,
         bridgeName: bridgeName.get(step.bridgeId) ?? '未归属桥梁',
         cumulativeLiftMm,
+        measuredLiftMm: measured,
+        measuredCumulativeLiftMm: measuredCumulative,
         overLimit,
         readingCount: rows.length,
         syncDeviationMm: deviation,
+        alertCount,
         validation: overLimit
-          ? `累计顶升量 ${cumulativeLiftMm} mm 已超过限位 ${step.limitMm} mm，需立即停止并复核`
+          ? `累计顶升量 ${referenceCumulative} mm 已超过限位 ${step.limitMm} mm，需立即停止并复核`
           : deviation !== null && syncLevel(deviation) === 'exceed'
             ? `同步偏差 ${deviation.toFixed(2)} mm 超允许值，需调平后继续`
             : '顶升参数与监测数据均在控制范围内',

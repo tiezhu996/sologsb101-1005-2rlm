@@ -12,6 +12,8 @@ import { MatInputModule } from '@angular/material/input';
 import { MatSelectModule } from '@angular/material/select';
 import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
 import { MatTooltipModule } from '@angular/material/tooltip';
+import { MatDialog } from '@angular/material/dialog';
+import { MatProgressBarModule } from '@angular/material/progress-bar';
 import { STEP_STATE_LABEL, SYNC_REQUIREMENT_LABEL, type StepView } from '../../../core/types/step';
 import {
   POINT_CODES,
@@ -26,8 +28,22 @@ import { ROUTES } from '../../../core/router/app.routes';
 import { stepActions } from '../../../core/store/step.actions';
 import { buildStepViews, selectStepStats } from '../../../core/store/step.selectors';
 import { selectBridges } from '../../../core/store/bridge.selectors';
+import { mergeActions } from '../../../core/store/merge.actions';
+import {
+  selectConflictGroups,
+  selectImportJobs,
+  selectMergeBusy,
+  selectMergeError,
+  selectMergeNotice,
+  selectPendingGroups,
+  selectUnresolvedGroups,
+} from '../../../core/store/merge.selectors';
+import {
+  PendingReviewDialogComponent,
+  type PendingReviewResult,
+} from '../../../shared/components/common/pending-review-dialog.component';
 import { IdbTableService } from '../../../core/services/idb-table.service';
-import { putReadings, rowMeta, newId, type ReadingRow } from '../../../core/utils/db';
+import { putReadings, rowMeta, newId, type ReadingRow, type DatabaseSnapshot } from '../../../core/utils/db';
 import { formatMm, formatStress } from '../../../core/utils/unit';
 import {
   TOLERANCE_HEX,
@@ -36,11 +52,12 @@ import {
   overallLevel,
   syncAlertText,
 } from '../../../core/utils/tolerance';
-import { nowDateTime } from '../../../core/utils/export';
+import { nowDateTime, readJsonFile } from '../../../core/utils/export';
 import { StatBadgeComponent } from '../../../shared/components/common/stat-badge.component';
 import { EmptyPanelComponent } from '../../../shared/components/common/empty-panel.component';
 import { FilterBarComponent, type FilterSelectSpec } from '../../../shared/components/common/filter-bar.component';
-import type { BridgeRow, StepRow } from '../../../core/utils/db';
+import type { BridgeRow, ImportJobRow, StepRow } from '../../../core/utils/db';
+import type { PendingGroup } from '../../../core/types/merge';
 import type { ToleranceLevel } from '../../../core/utils/tolerance';
 
 /** 批量录入的临时行 */
@@ -69,6 +86,7 @@ interface BatchRow {
     MatSelectModule,
     MatSnackBarModule,
     MatTooltipModule,
+    MatProgressBarModule,
     StatBadgeComponent,
     EmptyPanelComponent,
     FilterBarComponent,
@@ -246,6 +264,114 @@ interface BatchRow {
     </div>
 
     <div class="gb-section">
+      <mat-card appearance="outlined">
+        <div style="padding: 12px 14px">
+          <div class="gb-card-title">
+            离线合并（两组平板回机）
+            @if (mergeBusy()) {
+              <mat-progress-bar mode="indeterminate" style="max-width: 260px; display: inline-block; vertical-align: middle; margin-left: 12px"></mat-progress-bar>
+            }
+          </div>
+          <div class="gb-hint" style="margin-top: 4px">
+            选择另一组平板导出的整库 JSON：不信任设备记录号，先按「桥梁名称 + 步骤序号 + 测点编号」挂回本机步骤并按顺序暂存；
+            两边数值不同会并列保留，逐项确认后才进入正式读数。缺少应力字段的旧数据按缺测兼容读入。
+          </div>
+          <div class="gb-inline-actions" style="margin-top: 10px">
+            <label class="upload-label">
+              <input type="file" accept="application/json" hidden (change)="handleMergeFile($event)" />
+              <span mat-stroked-button>
+                <mat-icon>sync</mat-icon>
+                暂存设备包并挂接
+              </span>
+            </label>
+            <button
+              mat-stroked-button
+              [disabled]="recoverableJobs().length === 0 || mergeBusy()"
+              (click)="retryMerge()"
+            >
+              <mat-icon>history</mat-icon>
+              从检查点重试（{{ recoverableJobs().length }}）
+            </button>
+            <button
+              mat-flat-button
+              color="primary"
+              [disabled]="pendingGroups().length === 0 || mergeBusy()"
+              (click)="openReview()"
+            >
+              <mat-icon>fact_check</mat-icon>
+              逐项核对确认（{{ pendingGroups().length }} 组待处理）
+            </button>
+          </div>
+
+          @if (mergeError()) {
+            <div class="merge-err">
+              <mat-icon>error_outline</mat-icon>
+              <span>{{ mergeError() }}（已保留检查点，可点击「从检查点重试」，重试同一包不会重复建档）</span>
+            </div>
+          }
+          @if (mergeNotice()) {
+            <div class="merge-ok">
+              <mat-icon>check_circle_outline</mat-icon>
+              <span>{{ mergeNotice() }}</span>
+            </div>
+          }
+
+          @if (stagedJobs().length > 0) {
+            <div class="gb-table-wrap" style="margin-top: 10px">
+              <table class="gb-table">
+                <thead>
+                  <tr>
+                    <th>设备包</th>
+                    <th>来源</th>
+                    <th>阶段</th>
+                    <th>检查点进度</th>
+                    <th>状态</th>
+                    <th style="width: 120px">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  @for (job of stagedJobs(); track job.id) {
+                    <tr>
+                      <td class="gb-mono">{{ job.fileName }}</td>
+                      <td>{{ job.deviceId }}</td>
+                      <td>{{ job.phase === 'stage' ? '暂存建档' : '确认写入' }}</td>
+                      <td>{{ jobProgress(job) }}</td>
+                      <td [class.merge-err-text]="job.state === 'failed'">{{ jobStateLabel(job.state) }}</td>
+                      <td>
+                        <div class="gb-row-actions">
+                          @if (job.state === 'failed' || job.state === 'staging' || job.state === 'finalizing') {
+                            <button mat-button color="primary" [disabled]="mergeBusy()" (click)="resumeJob(job.id)">
+                              从检查点继续
+                            </button>
+                          } @else {
+                            <button mat-button color="primary" [disabled]="mergeBusy()" (click)="openReview()">
+                              逐项核对
+                            </button>
+                            <button mat-button color="warn" [disabled]="mergeBusy()" (click)="discardJob(job.id)">
+                              放弃暂存
+                            </button>
+                          }
+                        </div>
+                      </td>
+                    </tr>
+                  }
+                </tbody>
+              </table>
+            </div>
+          }
+
+          @if (pendingGroups().length > 0) {
+            <div class="gb-tags" style="margin-top: 10px">
+              <mat-chip highlighted>待确认分组 {{ pendingGroups().length }}</mat-chip>
+              <mat-chip class="merge-chip-conflict">数值冲突 {{ conflictGroups().length }}</mat-chip>
+              <mat-chip class="merge-chip-warn">无法挂接 {{ unresolvedGroups().length }}</mat-chip>
+            </div>
+          }
+        </div>
+      </mat-card>
+    </div>
+
+    <div class="gb-section">
       <div class="gb-card-title" style="margin-bottom: 8px">已录入读数（{{ filtered().length }} 条）</div>
       @if (filtered().length === 0) {
         <app-empty-panel
@@ -314,6 +440,38 @@ interface BatchRow {
         border-radius: 6px;
         font-size: 13px;
       }
+      .upload-label {
+        display: inline-block;
+      }
+      .merge-err,
+      .merge-ok {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 10px;
+        padding: 8px 12px;
+        border-radius: 8px;
+        font-size: 13px;
+      }
+      .merge-err {
+        background: #ffebee;
+        color: #b71c1c;
+      }
+      .merge-ok {
+        background: #e8f5e9;
+        color: #1b5e20;
+      }
+      .merge-err-text {
+        color: #c62828;
+      }
+      .merge-chip-conflict {
+        background: #ffebee !important;
+        color: #b71c1c !important;
+      }
+      .merge-chip-warn {
+        background: #fff4e5 !important;
+        color: #8d4b00 !important;
+      }
     `,
   ],
 })
@@ -321,6 +479,7 @@ export class ReadingEntryPage {
   private readonly store = inject(Store);
   private readonly idb = inject(IdbTableService);
   private readonly snackBar = inject(MatSnackBar);
+  private readonly dialog = inject(MatDialog);
   private readonly router = inject(Router);
   private readonly route = inject(ActivatedRoute);
 
@@ -355,6 +514,51 @@ export class ReadingEntryPage {
       maxLimitMm: 0,
     },
   });
+
+  /* ===================== 离线合并（两组平板回机） ===================== */
+  readonly pendingGroups: Signal<PendingGroup[]> = toSignal(this.store.select(selectPendingGroups), {
+    initialValue: [] as PendingGroup[],
+  });
+  readonly conflictGroups = toSignal(this.store.select(selectConflictGroups), { initialValue: [] as PendingGroup[] });
+  readonly unresolvedGroups = toSignal(this.store.select(selectUnresolvedGroups), {
+    initialValue: [] as PendingGroup[],
+  });
+  readonly mergeJobs: Signal<ImportJobRow[]> = toSignal(this.store.select(selectImportJobs), {
+    initialValue: [] as ImportJobRow[],
+  });
+  readonly mergeBusy = toSignal(this.store.select(selectMergeBusy), { initialValue: false });
+  readonly mergeNotice = toSignal(this.store.select(selectMergeNotice), { initialValue: '' });
+  readonly mergeError = toSignal(this.store.select(selectMergeError), { initialValue: '' });
+
+  /** 尚未结束（暂存 / 待确认 / 失败）的任务，按更新时间倒序 */
+  readonly stagedJobs = computed(() => this.mergeJobs().filter((job) => job.state !== 'done'));
+  /** 可从检查点继续的任务 */
+  readonly recoverableJobs = computed(() =>
+    this.mergeJobs().filter((job) => ['failed', 'staging', 'finalizing'].includes(job.state)),
+  );
+
+  jobStateLabel(state: ImportJobRow['state']): string {
+    switch (state) {
+      case 'staging':
+        return '暂存中…';
+      case 'staged':
+        return '已暂存待确认';
+      case 'finalizing':
+        return '确认写入中…';
+      case 'done':
+        return '已完成';
+      case 'failed':
+        return '写入失败（可继续）';
+    }
+  }
+
+  jobProgress(job: ImportJobRow): string {
+    if (job.phase === 'finalize') {
+      const total = job.finalized + job.finalizeQueue.length;
+      return `${job.finalized} / ${total || job.total} 条正式读数`;
+    }
+    return `${job.staged} / ${job.total} 条暂存`;
+  }
 
   readonly stepViews: Signal<StepView[]> = computed(() =>
     buildStepViews(this.steps(), this.readings(), this.bridges()),
@@ -397,7 +601,7 @@ export class ReadingEntryPage {
           syncRequirement: step ? SYNC_REQUIREMENT_LABEL[step.syncRequirement] : '-',
           deviationMm: Number((reading.displacementMm - average).toFixed(3)),
           overLimit: limitMm > 0 && Math.abs(reading.displacementMm) >= limitMm,
-          stressAlert: reading.stressMpa >= STRESS_ALERT_MPA,
+          stressAlert: reading.stressMpa !== null && reading.stressMpa >= STRESS_ALERT_MPA,
         };
       })
       .sort((a, b) => (a.stepSeq === b.stepSeq ? b.recordedAt.localeCompare(a.recordedAt) : a.stepSeq - b.stepSeq));
@@ -459,6 +663,8 @@ export class ReadingEntryPage {
       if (!this.selectedStepId() && this.stepViews().length > 0) {
         this.onStepChange(this.stepViews()[0].id);
       }
+      // 进入页面即拉取离线合并暂存与检查点
+      this.store.dispatch(mergeActions.load());
     });
   }
 
@@ -589,6 +795,67 @@ export class ReadingEntryPage {
     await this.idb.database.readings.delete(reading.id);
     this.idb.emitChange();
     this.snackBar.open('测点读数已删除', '关闭', { duration: 2400 });
+  }
+
+  /* ============================= 离线合并 ============================= */
+
+  /** 选择另一组平板的整库 JSON：挂接 → 顺序暂存（同包幂等，失败留检查点） */
+  async handleMergeFile(event: Event): Promise<void> {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file) return;
+    try {
+      const snapshot = await readJsonFile<DatabaseSnapshot>(file);
+      if (!snapshot || !Array.isArray(snapshot.readings) || !Array.isArray(snapshot.steps)) {
+        this.snackBar.open('文件格式不正确：缺少 steps / readings 数据，无法挂接', '关闭', { duration: 3200 });
+        return;
+      }
+      this.store.dispatch(mergeActions.stagePackage({ snapshot, fileName: file.name }));
+    } catch (error) {
+      this.snackBar.open(
+        `设备包解析失败：${error instanceof Error ? error.message : '文件异常'}`,
+        '关闭',
+        { duration: 3200 },
+      );
+    }
+  }
+
+  /** 打开逐项核对对话框；确认结果交给 effect 写正式读数并重算 */
+  openReview(): void {
+    const groups = this.pendingGroups();
+    if (groups.length === 0) return;
+    const dialogRef = this.dialog.open(PendingReviewDialogComponent, {
+      width: '880px',
+      maxWidth: '94vw',
+      data: { groups },
+    });
+    dialogRef.afterClosed().subscribe((result: PendingReviewResult | null) => {
+      if (!result) return;
+      this.store.dispatch(
+        mergeActions.confirmCandidates({
+          acceptedPendingIds: result.acceptedPendingIds,
+          rejectedPendingIds: result.rejectedPendingIds,
+        }),
+      );
+    });
+  }
+
+  /** 一键继续最近失败 / 中断的任务 */
+  retryMerge(): void {
+    const job = this.recoverableJobs()[0];
+    this.store.dispatch(mergeActions.resumeJob({ jobId: job?.id }));
+  }
+
+  /** 继续指定任务（暂存或确认阶段） */
+  resumeJob(jobId: string): void {
+    this.store.dispatch(mergeActions.resumeJob({ jobId }));
+  }
+
+  /** 放弃整包暂存（仅在尚未确认进入正式读数时允许） */
+  discardJob(jobId: string): void {
+    if (!confirm('放弃该设备包的全部暂存读数？不会影响已确认的正式读数。')) return;
+    this.store.dispatch(mergeActions.discardJob({ jobId }));
   }
 
   go(path: string): void {

@@ -255,7 +255,12 @@ export class StepDialogComponent {
                 <td>{{ step.bridgeName }}</td>
                 <td>{{ formatLift(step.targetLiftMm) }}</td>
                 <td [style.color]="step.overLimit ? '#c62828' : '#16222e'">
-                  {{ step.cumulativeLiftMm }} mm
+                  目标 {{ step.cumulativeLiftMm }} mm
+                  @if (step.measuredCumulativeLiftMm !== null) {
+                    <div [style.color]="step.overLimit ? '#c62828' : '#2e7d32'">
+                      实测 {{ step.measuredCumulativeLiftMm }} mm
+                    </div>
+                  }
                 </td>
                 <td>{{ step.limitMm }} mm</td>
                 <td [matTooltip]="syncHintOf(step)">{{ syncRequirementLabel[step.syncRequirement] }}</td>
@@ -271,6 +276,9 @@ export class StepDialogComponent {
                     <span [style.color]="levelColor(step)">
                       / 偏差 {{ formatMm(step.syncDeviationMm) }}（{{ levelLabel(step) }}）
                     </span>
+                  }
+                  @if (step.alertCount > 0) {
+                    <div style="color: #c62828">超限告警 {{ step.alertCount }} 条</div>
                   }
                 </td>
                 <td class="gb-hint">{{ step.validation }}</td>

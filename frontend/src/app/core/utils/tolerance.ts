@@ -35,8 +35,13 @@ export function limitLevel(displacementMm: number, limitMm: number): ToleranceLe
   return 'ok';
 }
 
-/** 应力等级判定 */
-export function stressLevel(stressMpa: number): ToleranceLevel {
+/**
+ * 应力等级判定。
+ * 兼容旧设备数据包：应力缺测（null / undefined / 非数字）时不参与告警，
+ * 综合判定改由位移限位结果决定。
+ */
+export function stressLevel(stressMpa: number | null | undefined): ToleranceLevel {
+  if (stressMpa === null || stressMpa === undefined || Number.isNaN(stressMpa)) return 'ok';
   if (stressMpa >= STRESS_TOLERANCE_MPA) return 'exceed';
   if (stressMpa >= STRESS_TOLERANCE_MPA * 0.8) return 'watch';
   return 'ok';
@@ -56,11 +61,11 @@ export const TOLERANCE_COLOR: Record<ToleranceLevel, 'primary' | 'accent' | 'war
   exceed: 'warn',
 };
 
-/** 综合判定：取位移与应力的最严等级 */
+/** 综合判定：取位移与应力的最严等级；应力缺测时只按位移判定 */
 export function overallLevel(
   displacementMm: number,
   limitMm: number,
-  stressMpa: number,
+  stressMpa: number | null | undefined,
 ): ToleranceLevel {
   const levels: ToleranceLevel[] = [limitLevel(displacementMm, limitMm), stressLevel(stressMpa)];
   if (levels.includes('exceed')) return 'exceed';
@@ -85,8 +90,10 @@ export function syncAlertText(deviationMm: number, requirement: string): string 
   return `${base} 满足同步要求（${requirement}）`;
 }
 
-/** 超限读数统计 */
-export function countExceed<T extends { displacementMm: number; stressMpa: number }>(
+/**
+ * 超限读数统计（应力字段可能缺测，按兼容方式只统计位移）。
+ */
+export function countExceed<T extends { displacementMm: number; stressMpa?: number | null }>(
   rows: T[],
   limitMm: number,
 ): { exceed: number; watch: number; ok: number } {
