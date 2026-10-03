@@ -4,18 +4,20 @@
  * 被顶升步骤页、测点读数页消费。
  */
 import { Injectable, inject } from '@angular/core';
-import { Observable, combineLatest, map, shareReplay } from 'rxjs';
+import { Observable, map, shareReplay } from 'rxjs';
 import { IdbTableService } from './idb-table.service';
 import { listBearings, listBridges, listReadings, listSteps } from '../utils/db';
 import type { BridgeRow, BearingRow, ReadingRow, StepRow } from '../utils/db';
-import { sortSteps, SYNC_REQUIREMENT_LABEL, type StepView } from '../types/step';
-import { meanDisplacement, syncDeviationMm, type ReadingView } from '../types/reading';
-import { overallLevel, syncLevel, type ToleranceLevel } from '../utils/tolerance';
+import { SYNC_REQUIREMENT_LABEL } from '../types/step';
+import type { ReadingView } from '../types/reading';
+import { meanDisplacement } from '../types/reading';
+import { buildOfficialStepViews, latestReadingRound, type OfficialStepView } from '../utils/monitoring';
+import { overallLevel, type ToleranceLevel } from '../utils/tolerance';
 
 /** 步骤时间线的一级节点 */
 export interface StepTimelineNode {
-  step: StepView;
-  /** 该步骤的读数（含偏差） */
+  step: OfficialStepView;
+  /** 该步骤最后一巡正式读数（含偏差） */
   readings: ReadingView[];
   /** 同步偏差等级 */
   deviationLevel: ToleranceLevel;
@@ -51,43 +53,36 @@ export class StepTimelineService {
     )
     .pipe(shareReplay({ bufferSize: 1, refCount: true }));
 
-  /** 步骤视图流：含累计顶升量、同步偏差与校验结论 */
-  readonly stepViews$: Observable<StepView[]> = this.snapshot$.pipe(
-    map((snapshot) => this.buildStepViews(snapshot)),
+  /** 步骤视图流：含按桥重算的累计顶升量、最后一巡同步偏差与校验结论 */
+  readonly stepViews$ = this.snapshot$.pipe(
+    map((snapshot) => buildOfficialStepViews(snapshot.bridges, snapshot.steps, snapshot.readings)),
     shareReplay({ bufferSize: 1, refCount: true }),
   );
 
-  /** 时间线节点流：步骤 + 该步读数 + 等级判定 */
-  readonly timeline$: Observable<StepTimelineNode[]> = combineLatest([
-    this.stepViews$,
-    this.snapshot$,
-  ]).pipe(
-    map(([steps, snapshot]) => {
+  /** 时间线节点流：步骤 + 最后一巡正式读数 + 等级判定 */
+  readonly timeline$: Observable<StepTimelineNode[]> = this.snapshot$.pipe(
+    map((snapshot) => {
+      const stepViews = buildOfficialStepViews(snapshot.bridges, snapshot.steps, snapshot.readings);
       const bridges = new Map(snapshot.bridges.map((item) => [item.id, item.name]));
-      return steps.map((step) => {
-        const stepReadings = snapshot.readings
-          .filter((item) => item.stepId === step.id)
-          .sort((a, b) => a.recordedAt.localeCompare(b.recordedAt))
-          .map<ReadingView>((reading) => {
-            const sameRound = snapshot.readings.filter(
-              (item) => item.stepId === reading.stepId && item.recordedAt === reading.recordedAt,
-            );
-            const average = meanDisplacement(sameRound);
-            return {
-              ...reading,
-              stepSeq: step.seq,
-              bridgeId: step.bridgeId,
-              bridgeName: bridges.get(step.bridgeId) ?? '未归属桥梁',
-              syncRequirement: SYNC_REQUIREMENT_LABEL[step.syncRequirement],
-              deviationMm: Number((reading.displacementMm - average).toFixed(3)),
-              overLimit: Math.abs(reading.displacementMm) >= step.limitMm,
-              stressAlert: reading.stressMpa >= 12,
-            };
-          });
+      return stepViews.map((step) => {
+        const round = latestReadingRound(step, snapshot.readings);
+        const average = meanDisplacement(round);
+        const stepReadings = round.map<ReadingView>((reading) => ({
+          ...reading,
+          stepSeq: step.seq,
+          bridgeId: step.bridgeId,
+          bridgeName: bridges.get(step.bridgeId) ?? step.bridgeName,
+          syncRequirement: SYNC_REQUIREMENT_LABEL[step.syncRequirement],
+          deviationMm: Number((reading.displacementMm - average).toFixed(3)),
+          overLimit: Math.abs(reading.displacementMm) >= step.limitMm,
+          stressAlert: reading.stressMpa >= 12,
+        }));
+        const deviationLevel: ToleranceLevel =
+          step.syncDeviationMm === null ? 'ok' : step.syncDeviationMm >= 1.5 ? 'exceed' : step.syncDeviationMm >= 0.8 ? 'watch' : 'ok';
         return {
           step,
           readings: stepReadings,
-          deviationLevel: syncLevel(step.syncDeviationMm ?? 0),
+          deviationLevel,
           limitLevel: stepReadings.reduce<ToleranceLevel>((worst, reading) => {
             const level = overallLevel(reading.displacementMm, step.limitMm, reading.stressMpa);
             if (level === 'exceed' || worst === 'exceed') return 'exceed';
@@ -101,9 +96,9 @@ export class StepTimelineService {
   );
 
   /** 按桥梁分组的步骤流 */
-  readonly stepsByBridge$: Observable<Map<string, StepView[]>> = this.stepViews$.pipe(
+  readonly stepsByBridge$ = this.stepViews$.pipe(
     map((steps) => {
-      const grouped = new Map<string, StepView[]>();
+      const grouped = new Map<string, OfficialStepView[]>();
       for (const step of steps) {
         const list = grouped.get(step.bridgeId) ?? [];
         list.push(step);
@@ -114,11 +109,12 @@ export class StepTimelineService {
     shareReplay({ bufferSize: 1, refCount: true }),
   );
 
-  /** 累计顶升量流：桥梁 id → 累计值 */
-  readonly cumulativeLift$: Observable<Record<string, number>> = this.stepViews$.pipe(
+  /** 计划累计顶升量流：桥梁 id → 累计值 */
+  readonly cumulativeLift$ = this.stepViews$.pipe(
     map((steps) => {
       const totals: Record<string, number> = {};
       for (const step of steps) {
+        if (step.seq === 1) totals[step.bridgeId] = 0;
         totals[step.bridgeId] = Number(((totals[step.bridgeId] ?? 0) + step.targetLiftMm).toFixed(2));
       }
       return totals;
@@ -126,13 +122,14 @@ export class StepTimelineService {
     shareReplay({ bufferSize: 1, refCount: true }),
   );
 
-  /** 同步偏差流：步骤 id → 偏差 */
-  readonly syncDeviation$: Observable<Record<string, number>> = this.snapshot$.pipe(
+  /** 最后一巡同步偏差流：步骤 id → 偏差 */
+  readonly syncDeviation$ = this.snapshot$.pipe(
     map((snapshot) => {
       const result: Record<string, number> = {};
       for (const step of snapshot.steps) {
-        const rows = snapshot.readings.filter((item) => item.stepId === step.id);
-        result[step.id] = syncDeviationMm(rows);
+        result[step.id] = 0;
+        const round = latestReadingRound(step, snapshot.readings);
+        if (round.length) result[step.id] = Math.max(...round.map((item) => item.displacementMm)) - Math.min(...round.map((item) => item.displacementMm));
       }
       return result;
     }),
@@ -140,33 +137,7 @@ export class StepTimelineService {
   );
 
   /** 构建步骤视图（供派生流与页面共用） */
-  buildStepViews(snapshot: StepTimelineSnapshot): StepView[] {
-    const bridgeName = new Map(snapshot.bridges.map((item) => [item.id, item.name]));
-    const ordered = sortSteps(snapshot.steps);
-    const cumulative = new Map<string, number>();
-    let running = 0;
-    for (const step of ordered) {
-      running += step.targetLiftMm;
-      cumulative.set(step.id, Number(running.toFixed(2)));
-    }
-    return ordered.map((step) => {
-      const rows = snapshot.readings.filter((item) => item.stepId === step.id);
-      const cumulativeLiftMm = cumulative.get(step.id) ?? step.targetLiftMm;
-      const deviation = rows.length > 0 ? syncDeviationMm(rows) : null;
-      const overLimit = cumulativeLiftMm > step.limitMm;
-      return {
-        ...step,
-        bridgeName: bridgeName.get(step.bridgeId) ?? '未归属桥梁',
-        cumulativeLiftMm,
-        overLimit,
-        readingCount: rows.length,
-        syncDeviationMm: deviation,
-        validation: overLimit
-          ? `累计顶升量 ${cumulativeLiftMm} mm 已超过限位 ${step.limitMm} mm，需立即停止并复核`
-          : deviation !== null && syncLevel(deviation) === 'exceed'
-            ? `同步偏差 ${deviation.toFixed(2)} mm 超允许值，需调平后继续`
-            : '顶升参数与监测数据均在控制范围内',
-      };
-    });
+  buildStepViews(snapshot: StepTimelineSnapshot): OfficialStepView[] {
+    return buildOfficialStepViews(snapshot.bridges, snapshot.steps, snapshot.readings);
   }
 }

@@ -38,6 +38,18 @@ import { escalateGrade } from '../types/bearing';
 import { resequenceSteps } from '../types/step';
 import { checkBridgeArchived } from './archive.helper';
 
+async function reconcileBridgeArchiveFlags(): Promise<void> {
+  const check = await checkBridgeArchived();
+  const archivable = new Set(check.archivableBridgeIds);
+  const bridges = await listBridges();
+  await Promise.all(
+    bridges.map((bridge) => {
+      const shouldArchive = archivable.has(bridge.id);
+      return bridge.archived !== shouldArchive ? putBridge({ ...bridge, archived: shouldArchive }) : Promise.resolve();
+    }),
+  );
+}
+
 @Injectable()
 export class AppEffects {
   private readonly actions$ = inject(Actions);
@@ -594,15 +606,18 @@ export class AppEffects {
         ofType(acceptanceActions.createAcceptance),
         switchMap(({ draft }) =>
           from(
-            putAcceptance({
-              id: newId('acc'),
-              bearingId: draft.bearingId,
-              stage: draft.stage,
-              conclusion: draft.conclusion,
-              acceptor: draft.acceptor.trim(),
-              acceptedAt: draft.acceptedAt,
-              ...rowMeta(),
-            }),
+            (async () => {
+              await putAcceptance({
+                id: newId('acc'),
+                bearingId: draft.bearingId,
+                stage: draft.stage,
+                conclusion: draft.conclusion,
+                acceptor: draft.acceptor.trim(),
+                acceptedAt: draft.acceptedAt,
+                ...rowMeta(),
+              });
+              await reconcileBridgeArchiveFlags();
+            })(),
           ).pipe(
             map(() => {
               this.idb.emitChange();
@@ -637,6 +652,7 @@ export class AppEffects {
                 acceptor: draft.acceptor.trim(),
                 acceptedAt: draft.acceptedAt,
               });
+              await reconcileBridgeArchiveFlags();
               this.idb.emitChange();
             })(),
           ).pipe(
@@ -658,7 +674,12 @@ export class AppEffects {
       this.actions$.pipe(
         ofType(acceptanceActions.deleteAcceptance),
         switchMap(({ id }) =>
-          from(removeAcceptance(id)).pipe(
+          from(
+            (async () => {
+              await removeAcceptance(id);
+              await reconcileBridgeArchiveFlags();
+            })(),
+          ).pipe(
             map(() => {
               this.idb.emitChange();
               return writeSucceeded({ message: '数据已保存' });
@@ -694,6 +715,7 @@ export class AppEffects {
               }));
               await Promise.all(rows.map((row) => putAcceptance(row)));
               const check = await checkBridgeArchived();
+              await reconcileBridgeArchiveFlags();
               this.idb.emitChange();
               return check.summaries.join('；');
             })(),

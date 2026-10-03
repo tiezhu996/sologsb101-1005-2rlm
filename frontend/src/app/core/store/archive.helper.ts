@@ -1,10 +1,11 @@
 /**
  * 归档判定辅助：检查是否所有支座均已完成四步验收，返回可归档的桥梁摘要。
- * 被 acceptance store 的批量签署 effect 调用。
+ * 正式读数确认后按最后一巡重算累计顶升量、同步偏差与超限告警。
  */
 import { listAcceptances, listBearings, listBridges, listPiers, listReadings, listSteps } from '../utils/db';
 import { ACCEPTANCE_STAGES } from '../types/acceptance';
 import { archiveSummary } from '../types/acceptance';
+import { buildBridgeMonitoring } from '../utils/monitoring';
 
 export interface ArchiveCheckResult {
   /** 已满足归档条件的桥梁 id */
@@ -23,6 +24,7 @@ export async function checkBridgeArchived(): Promise<ArchiveCheckResult> {
     listSteps(),
     listReadings(),
   ]);
+  const monitoringById = new Map(buildBridgeMonitoring(bridges, steps, readings).map((item) => [item.bridgeId, item]));
 
   const archivableBridgeIds: string[] = [];
   const summaries: string[] = [];
@@ -37,23 +39,22 @@ export async function checkBridgeArchived(): Promise<ArchiveCheckResult> {
           .filter((item) => item.bearingId === bearing.id && item.conclusion === 'pass')
           .map((item) => item.stage),
       );
-      const failed = acceptances.some(
-        (item) => item.bearingId === bearing.id && item.conclusion === 'fail',
-      );
+      const failed = acceptances.some((item) => item.bearingId === bearing.id && item.conclusion === 'fail');
       return !failed && ACCEPTANCE_STAGES.every((stage) => passed.has(stage));
     });
     if (fullyAccepted.length < ownedBearings.length) continue;
 
-    const bridgeSteps = steps.filter((item) => item.bridgeId === bridge.id);
-    const stepIds = new Set(bridgeSteps.map((item) => item.id));
+    const monitor = monitoringById.get(bridge.id);
     archivableBridgeIds.push(bridge.id);
     summaries.push(
       archiveSummary({
         bridgeName: bridge.name,
         bearingCount: ownedBearings.length,
-        totalLiftMm: Number(bridgeSteps.reduce((sum, item) => sum + item.targetLiftMm, 0).toFixed(2)),
-        stepCount: bridgeSteps.length,
-        readingCount: readings.filter((item) => stepIds.has(item.stepId)).length,
+        totalLiftMm: monitor?.observedLiftMm ?? 0,
+        stepCount: monitor?.stepCount ?? 0,
+        readingCount: monitor?.readingCount ?? 0,
+        syncDeviationMm: monitor?.syncDeviationMm ?? 0,
+        alertCount: monitor?.overLimitCount ?? 0,
       }),
     );
   }

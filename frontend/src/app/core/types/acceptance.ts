@@ -95,6 +95,12 @@ export function archiveSummary(input: {
   totalLiftMm: number;
   stepCount: number;
   readingCount: number;
+  syncDeviationMm?: number;
+  alertCount?: number;
 }): string {
-  return `${input.bridgeName}：${input.stepCount} 级顶升、累计 ${input.totalLiftMm} mm、${input.bearingCount} 个支座更换、${input.readingCount} 条测点读数已归档`;
+  const monitorText =
+    input.syncDeviationMm !== undefined || input.alertCount !== undefined
+      ? `、最大同步偏差 ${input.syncDeviationMm ?? 0} mm、${input.alertCount ?? 0} 条超限告警`
+      : '';
+  return `${input.bridgeName}：${input.stepCount} 级顶升、累计实测 ${input.totalLiftMm} mm、${input.bearingCount} 个支座更换、${input.readingCount} 条正式测点读数${monitorText}已归档`;
 }

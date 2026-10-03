@@ -27,6 +27,8 @@ import {
   type AcceptanceView,
 } from '../../../core/types/acceptance';
 import { DISEASE_GRADE_LABEL } from '../../../core/types/bearing';
+import { meanDisplacement, syncDeviationMm } from '../../../core/types/reading';
+import { latestReadingRound } from '../../../core/utils/monitoring';
 import { ROUTES } from '../../../core/router/app.routes';
 import { acceptanceActions } from '../../../core/store/acceptance.actions';
 import {
@@ -36,7 +38,7 @@ import {
 } from '../../../core/store/acceptance.selectors';
 import { selectBridges, selectPiers } from '../../../core/store/bridge.selectors';
 import { selectBearings } from '../../../core/store/bearing.selectors';
-import { selectStepStats } from '../../../core/store/step.selectors';
+import { selectStepStats, selectSteps, selectReadings } from '../../../core/store/step.selectors';
 import { selectStepState } from '../../../core/store/step.selectors';
 import { bridgeActions } from '../../../core/store/bridge.actions';
 import {
@@ -45,7 +47,6 @@ import {
   ROW_REVISION,
   countAll,
   exportSnapshot,
-  importSnapshot,
   resetDatabase,
   schemaInfo,
   type DatabaseSnapshot,
@@ -57,12 +58,16 @@ import { StatBadgeComponent } from '../../../shared/components/common/stat-badge
 import { EmptyPanelComponent } from '../../../shared/components/common/empty-panel.component';
 import { FilterBarComponent, type FilterSelectSpec } from '../../../shared/components/common/filter-bar.component';
 import { GradeTagComponent } from '../../../shared/components/common/grade-tag.component';
+import { OfflineMergeService } from '../../../core/services/offline-merge.service';
 import type {
   AcceptanceRow,
   BearingRow,
   BridgeRow,
   PierRow,
+  ReadingRow,
+  StepRow,
 } from '../../../core/utils/db';
+import type { PendingReadingView } from '../../../core/types/offline-merge';
 
 /**
  * /acceptances 分步验收与归档
@@ -94,7 +99,7 @@ import type {
       <div>
         <h2 class="page-title">分步验收与归档</h2>
         <div class="page-sub">
-          按「顶升到位 → 支座就位 → 落梁 → 竣工」四步签署验收，全部支座合格后可执行竣工归档，并支持整库 JSON 迁移。
+        按「顶升到位 → 支座就位 → 落梁 → 竣工」四步签署验收；支持两组平板离线整库合并，冲突读数逐项确认，全部支座合格后执行竣工归档。
         </div>
       </div>
       <div class="gb-inline-actions">
@@ -102,13 +107,6 @@ import type {
           <mat-icon>cloud_download</mat-icon>
           导出 JSON
         </button>
-        <label class="upload-label">
-          <input type="file" accept="application/json" hidden (change)="handleImport($event)" />
-          <span mat-stroked-button>
-            <mat-icon>cloud_upload</mat-icon>
-            导入 JSON
-          </span>
-        </label>
         <button mat-flat-button color="warn" (click)="handleReset()">
           <mat-icon>restart_alt</mat-icon>
           重置演示数据
@@ -133,13 +131,101 @@ import type {
         [hint]="fullyAcceptedCount() + ' / ' + bearings().length + ' 个支座四步全合格'"
       />
       <app-stat-badge
-        title="累计顶升量"
+        title="计划累计顶升量"
         [value]="stepStats().cumulativeMm"
         [suffix]="'mm'"
         color="#3949ab"
         [hint]="'共 ' + stepStats().total + ' 级顶升、' + stepStats().readingCount + ' 条读数'"
       />
     </div>
+
+    <mat-card appearance="outlined" class="gb-section offline-card">
+      <div style="padding: 12px 14px">
+        <div class="gb-card-title">
+          离线读数合并
+          <mat-chip highlighted>{{ pendingReadings().length }} 条暂存</mat-chip>
+          <mat-chip [class.conflict-chip]="pendingConflictCount() > 0">{{ pendingConflictCount() }} 条待确认冲突</mat-chip>
+          <mat-chip [class.conflict-chip]="pendingUnmatchedCount() > 0">{{ pendingUnmatchedCount() }} 条未挂接</mat-chip>
+        </div>
+        <div class="gb-hint" style="margin-top: 6px">
+          两台平板记录号不同也不覆盖：先按桥梁名称、步骤序号、测点编号挂接，同测点不同数值并列暂存，逐项确认后才进入正式读数。
+        </div>
+        @if (importSummary()) {
+          <div class="gb-hint" style="margin-top: 8px; color: #1565c0">{{ importSummary() }}</div>
+        }
+        <div class="gb-inline-actions" style="margin-top: 10px">
+          <label class="upload-label">
+            <input type="file" accept="application/json" hidden (change)="handleOfflineImport($event)" />
+            <span mat-stroked-button>
+              <mat-icon>sync</mat-icon>
+              离线合并导入
+            </span>
+          </label>
+          <button mat-stroked-button [disabled]="importing()" (click)="refreshPending()">
+            <mat-icon>refresh</mat-icon>
+            刷新检查点
+          </button>
+        </div>
+        @if (pendingReadings().length > 0) {
+          <div class="gb-table-wrap" style="margin-top: 10px">
+            <table class="gb-table">
+              <thead>
+                <tr>
+                  <th>桥梁 / 步骤 / 测点</th>
+                  <th>并列候选</th>
+                  <th>位移</th>
+                  <th>应力</th>
+                  <th>来源记录号 / 顺序</th>
+                  <th>状态</th>
+                  <th style="width: 170px">处理</th>
+                </tr>
+              </thead>
+              <tbody>
+                @for (row of pendingReadings(); track row.id) {
+                  <tr [class.is-conflict]="row.hasConflict && row.status === 'pending'">
+                    <td>
+                      {{ row.bridgeName }} · #{{ row.stepSeq }} · {{ row.pointCode }}
+                      @if (!row.matched) {
+                        <div class="gb-hint conflict-text">未找到本机步骤</div>
+                      }
+                      @if (row.note) {
+                        <div class="gb-hint">{{ row.note }}</div>
+                      }
+                      <div class="gb-hint">测量时间：{{ row.recordedAt || '未填写' }}</div>
+                    </td>
+                    <td>{{ row.groupSize }} 条</td>
+                    <td>{{ row.displacementMm }} mm</td>
+                    <td>{{ row.stressMpa === null ? '旧版未记录' : row.stressMpa + ' MPa' }}</td>
+                    <td class="gb-hint">{{ row.sourceRecordId }} / #{{ row.packageSeq }}</td>
+                    <td>{{ pendingStatusText(row.status) }}</td>
+                    <td>
+                      <div class="gb-row-actions">
+                        <button
+                          mat-button
+                          color="primary"
+                          [disabled]="!row.matched || row.status === 'confirmed'"
+                          (click)="confirmPending(row.id)"
+                        >
+                          确认
+                        </button>
+                        <button
+                          mat-button
+                          color="warn"
+                          [disabled]="row.status === 'rejected'"
+                          (click)="rejectPending(row.id)"
+                        >
+                          驳回
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                }
+              </tbody>
+            </table>
+          </div>
+        }
+      </div>
+    </mat-card>
 
     @if (lastArchiveSummary()) {
       <mat-card appearance="outlined" class="gb-section">
@@ -403,12 +489,22 @@ import type {
         background: #eceff1 !important;
         color: #546e7a !important;
       }
+      .conflict-chip {
+        color: #c62828;
+      }
+      .is-conflict {
+        background: #fff8e1;
+      }
+      .conflict-text {
+        color: #c62828;
+      }
     `,
   ],
 })
 export class AcceptanceArchivePage {
   private readonly store = inject(Store);
   private readonly idb = inject(IdbTableService);
+  private readonly offlineMerge = inject(OfflineMergeService);
   private readonly snackBar = inject(MatSnackBar);
   private readonly router = inject(Router);
   private readonly route = inject(ActivatedRoute);
@@ -438,7 +534,23 @@ export class AcceptanceArchivePage {
     this.store.select((state) => state.acceptance.acceptances),
     { initialValue: [] as AcceptanceRow[] },
   );
+  private readonly archiveSteps: Signal<StepRow[]> = toSignal(this.store.select(selectSteps), {
+    initialValue: [] as StepRow[],
+  });
+  private readonly archiveReadings: Signal<ReadingRow[]> = toSignal(this.store.select(selectReadings), {
+    initialValue: [] as ReadingRow[],
+  });
   private readonly counts = toSignal(this.idb.countAll$(), { initialValue: {} as Record<string, number> });
+  readonly pendingReadings = signal<PendingReadingView[]>([]);
+  readonly importing = signal(false);
+  readonly importSummary = signal('');
+
+  readonly pendingConflictCount = computed(
+    () => this.pendingReadings().filter((item) => item.status === 'pending' && item.hasConflict).length,
+  );
+  readonly pendingUnmatchedCount = computed(
+    () => this.pendingReadings().filter((item) => item.status === 'pending' && !item.matched).length,
+  );
 
   readonly stats = toSignal(this.store.select(selectAcceptanceStats), {
     initialValue: { total: 0, pass: 0, fail: 0, byStage: [] },
@@ -538,6 +650,7 @@ export class AcceptanceArchivePage {
     queueMicrotask(() => {
       if (this.selected().length === 0) this.selectAllBearings();
     });
+    void this.refreshPending();
   }
 
   /** 某支座在指定分步是否已通过 */
@@ -658,17 +771,54 @@ export class AcceptanceArchivePage {
     this.notify('验收记录已删除');
   }
 
+  private pierIdsForBridge(bridgeId: string): Set<string> {
+    return new Set(this.piers().filter((item) => item.bridgeId === bridgeId).map((item) => item.id));
+  }
+
+  private stepViewsForArchive(): StepRow[] {
+    return this.archiveSteps();
+  }
+
+  private readingsForArchive(): ReadingRow[] {
+    return this.archiveReadings();
+  }
+
+  private archiveStepRows(stepId: string): ReadingRow[] {
+    const step = this.archiveSteps().find((item) => item.id === stepId);
+    return step ? latestReadingRound(step, this.archiveReadings()) : [];
+  }
+
+  private observedStepLift(stepId: string, fallback: number): number {
+    const rows = this.archiveStepRows(stepId);
+    return rows.length ? meanDisplacement(rows) : fallback;
+  }
+
+  private stepLastDeviation(stepId: string): number {
+    return syncDeviationMm(this.archiveStepRows(stepId));
+  }
+
   archiveActive(archived: boolean): void {
     const bridgeId = this.activeBridgeId();
     if (!bridgeId) return;
     const bridge = this.bridges().find((item) => item.id === bridgeId);
     if (!bridge) return;
+    const bridgeSteps = this.stepViewsForArchive().filter((item) => item.bridgeId === bridgeId);
+    const stepIds = new Set(bridgeSteps.map((item) => item.id));
     const summary = archiveSummary({
       bridgeName: bridge.name,
-      bearingCount: this.bearingRows().length,
-      totalLiftMm: this.stepStats().cumulativeMm,
-      stepCount: this.stepStats().total,
-      readingCount: this.stepStats().readingCount,
+      bearingCount: this.bearingRows().filter((bearing) => this.pierIdsForBridge(bridgeId).has(bearing.pierId)).length,
+      totalLiftMm: Number(
+        bridgeSteps.reduce((sum, item) => sum + (this.observedStepLift(item.id, item.targetLiftMm)), 0).toFixed(2),
+      ),
+      stepCount: bridgeSteps.length,
+      readingCount: this.readingsForArchive().filter((reading) => stepIds.has(reading.stepId)).length,
+      syncDeviationMm: Number(
+        Math.max(
+          ...bridgeSteps.map((item) => this.stepLastDeviation(item.id)),
+          0,
+        ).toFixed(3),
+      ),
+      alertCount: bridgeSteps.filter((item) => this.stepLastDeviation(item.id) >= 1.5).length,
     });
     if (archived) {
       const pierIds = new Set(this.piers().filter((item) => item.bridgeId === bridgeId).map((item) => item.id));
@@ -695,17 +845,69 @@ export class AcceptanceArchivePage {
     const file = input.files?.[0];
     input.value = '';
     if (!file) return;
+    await this.importOfflineFile(file);
+  }
+
+  async handleOfflineImport(event: Event): Promise<void> {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file) return;
+    await this.importOfflineFile(file);
+  }
+
+  async refreshPending(): Promise<void> {
+    this.pendingReadings.set(await this.offlineMerge.listPendingViews());
+  }
+
+  pendingStatusText(status: string): string {
+    if (status === 'confirmed') return '已入正式读数';
+    if (status === 'rejected') return '已驳回';
+    return '待确认';
+  }
+
+  async confirmPending(id: string): Promise<void> {
+    try {
+      await this.offlineMerge.confirmPending(id);
+      this.idb.emitChange();
+      await this.refreshPending();
+      this.notify('已确认并进入正式读数，累计顶升量、同步偏差和告警已重算');
+    } catch (error) {
+      this.notify(`确认失败：${error instanceof Error ? error.message : '写入异常'}`);
+    }
+  }
+
+  async rejectPending(id: string): Promise<void> {
+    try {
+      await this.offlineMerge.rejectPending(id);
+      this.idb.emitChange();
+      await this.refreshPending();
+      this.notify('该候选已驳回并保留处理痕迹');
+    } catch (error) {
+      this.notify(`驳回失败：${error instanceof Error ? error.message : '写入异常'}`);
+    }
+  }
+
+  private async importOfflineFile(file: File): Promise<void> {
+    this.importing.set(true);
     try {
       const snapshot = await readJsonFile<DatabaseSnapshot>(file);
       if (!snapshot || !Array.isArray(snapshot.bridges)) {
         this.notify('文件格式不正确：缺少 bridges 数组');
         return;
       }
-      await importSnapshot(snapshot);
+      const result = await this.offlineMerge.mergeSnapshot(snapshot, file.name);
       this.idb.emitChange();
-      this.notify(`导入完成：${snapshot.bridges.length} 座桥梁、${snapshot.bearings?.length ?? 0} 个支座`);
+      await this.refreshPending();
+      const retryText = result.resumed ? `已从检查点 ${result.job.processedCount} 续传；` : '';
+      this.importSummary.set(
+        `${retryText}暂存 ${result.insertedCount} 条，跳过同包 ${result.skippedCount} 条，冲突 ${result.conflictCount} 条，未挂接 ${result.unmatchedCount} 条`,
+      );
+      this.notify(`离线合并完成：${result.insertedCount} 条进入待确认，失败重试不会重复建档`);
     } catch (error) {
-      this.notify(`导入失败：${error instanceof Error ? error.message : '文件解析异常'}`);
+      this.notify(`离线导入失败：${error instanceof Error ? error.message : '文件解析异常'}；可重新选择同一文件从检查点继续`);
+    } finally {
+      this.importing.set(false);
     }
   }
 
@@ -713,6 +915,7 @@ export class AcceptanceArchivePage {
     if (!confirm('确认清空当前全部本地数据并重新播种演示数据？')) return;
     await resetDatabase();
     this.idb.emitChange();
+    await this.refreshPending();
     this.notify('已清空并重新播种演示数据');
   }
 

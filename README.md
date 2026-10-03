@@ -28,6 +28,8 @@ docker compose up -d --build # 代码改动后重建
 - 编排分级顶升步骤（目标顶升量、同步要求、限位值、负责人），支持上移 / 下移调序与**累计顶升量校验**
 - 按步骤批量录入多测点位移与应力，实时计算**同步偏差**（同批次极差）并按限位值给出告警
 - 四步签署验收（顶升到位 → 支座就位 → 落梁 → 竣工），全部支座合格后可执行竣工归档
+- 支持两组平板离线整库合并：按「桥梁名称 + 步骤序号 + 测点编号」挂接，设备记录号不同也不覆盖；冲突读数并列暂存、逐项确认，支持失败重试检查点与同包幂等导入
+- 正式读数确认后按最后一巡重算累计顶升量、同步偏差、超限告警，并同步支座验收归档
 - 查看 IndexedDB 结构版本并导出 / 导入整库 JSON
 
 本项目为**纯前端单页应用**：无后端、无数据库服务、无外部接口，全部数据保存在浏览器 IndexedDB。
@@ -80,12 +82,12 @@ sologsb101-1005/
             ├── app.component.ts          # 应用外壳（工具栏 + 侧边导航 + 统计）
             ├── app.config.ts             # provideRouter / provideStore / provideEffects
             ├── core/
-            │   ├── types/                # bridge.ts pier.ts bearing.ts step.ts reading.ts acceptance.ts persistence.ts
+            │   ├── types/                # bridge.ts pier.ts bearing.ts step.ts reading.ts acceptance.ts offline-merge.ts persistence.ts
             │   ├── store/                # app.actions.ts notice.reducer.ts archive.helper.ts
             │   │                         # bridge.store/reducer/selectors、bearing.*、step.*、acceptance.*、app.effects.ts
-            │   ├── services/             # idb-table.service.ts step-timeline.service.ts change-bus.service.ts
+            │   ├── services/             # idb-table.service.ts step-timeline.service.ts offline-merge.service.ts change-bus.service.ts
             │   ├── router/app.routes.ts
-            │   └── utils/                # unit.ts tolerance.ts db.ts export.ts
+            │   └── utils/                # unit.ts tolerance.ts monitoring.ts db.ts export.ts
             ├── shared/components/common/ # grade-tag / filter-bar / stat-badge / empty-panel
             └── features/
                 ├── bridges/pages/bridge-list.page.ts
@@ -98,7 +100,7 @@ sologsb101-1005/
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbbridgebear`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`core/utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记 v1 → v2 的 `upgrade` 迁移（补齐行修订号、迁移 `span → spanCombo`、`grade → diseaseGrade`、`syncType → syncRequirement`、`limit → limitMm`，新增 `settings` 表）。
+- **数据结构版本**：`core/utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`，登记 v1 → v2 → v3 迁移（v2 补齐行修订号、迁移历史字段并新增 settings；v3 新增 `pendingReadings` / `offlineImports` 离线合并表，旧读数缺少应力字段时兼容读入）。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |
@@ -107,7 +109,9 @@ sologsb101-1005/
   | `piers` | 墩台 | id / bridgeId / code / capElevation / [bridgeId+code] |
   | `bearings` | 支座 | id / pierId / diseaseGrade / type / serial / [pierId+serial] |
   | `steps` | 顶升步骤 | id / bridgeId / seq / state / syncRequirement / [bridgeId+seq] |
-  | `readings` | 测点读数 | id / stepId / pointCode / recordedAt / [stepId+pointCode] |
+  | `readings` | 正式测点读数 | id / stepId / pointCode / recordedAt / [stepId+pointCode] |
+  | `pendingReadings` | 离线导入待确认读数 | id / packageId / bridgeName / stepSeq / pointCode / status / conflictKey |
+  | `offlineImports` | 离线导入批次检查点 | id / packageId / status / updatedAt |
   | `acceptances` | 分步验收 | id / bearingId / stage / conclusion / [bearingId+stage] |
   | `settings` | 自定义字典 | id |
 

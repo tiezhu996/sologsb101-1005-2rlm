@@ -12,13 +12,14 @@ import type { Bearing, DiseaseGrade } from '../types/bearing';
 import type { Step, SyncRequirement } from '../types/step';
 import type { Reading } from '../types/reading';
 import type { Acceptance, AcceptanceStage } from '../types/acceptance';
+import type { OfflineImportJob, PendingReading } from '../types/offline-merge';
 import { ROW_REVISION, type Revisioned } from '../types/persistence';
 
 /** 浏览器 IndexedDB 库名 */
 export const DB_NAME = 'gbbridgebear';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -28,6 +29,9 @@ export type PierRow = Pier;
 export type BearingRow = Bearing;
 export type StepRow = Step;
 export type ReadingRow = Reading;
+export type LegacyReadingRow = Omit<Reading, 'stressMpa'> & { stressMpa?: number | null };
+export type PendingReadingRow = PendingReading;
+export type OfflineImportJobRow = OfflineImportJob;
 export type AcceptanceRow = Acceptance;
 
 class BridgeBearingDatabase extends Dexie {
@@ -36,6 +40,8 @@ class BridgeBearingDatabase extends Dexie {
   bearings!: Table<BearingRow, string>;
   steps!: Table<StepRow, string>;
   readings!: Table<ReadingRow, string>;
+  pendingReadings!: Table<PendingReading, string>;
+  offlineImports!: Table<OfflineImportJob, string>;
   acceptances!: Table<AcceptanceRow, string>;
   settings!: Table<{ id: string; value: string; updatedAt: string }, string>;
 
@@ -54,7 +60,7 @@ class BridgeBearingDatabase extends Dexie {
 
     // v2：新增 revision 行修订号；支座补充组合索引便于按墩台批量评级，
     //     顶升步骤补充同步要求索引，验收补充组合索引，并新增 settings 表
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         bridges: 'id, name, bridgeType, builtYear, roadClass, archived',
         piers: 'id, bridgeId, code, capElevation, [bridgeId+code]',
@@ -100,6 +106,37 @@ class BridgeBearingDatabase extends Dexie {
           if (typeof row.targetLiftMm !== 'number' && typeof row.lift === 'number') row.targetLiftMm = row.lift;
         });
       });
+
+    // v3：离线合并增加导入批次与待确认读数表；旧读数缺少 stressMpa 时保留为空，按兼容数据读入
+    this.version(DB_SCHEMA_VERSION).stores({
+      bridges: 'id, name, bridgeType, builtYear, roadClass, archived',
+      piers: 'id, bridgeId, code, capElevation, [bridgeId+code]',
+      bearings: 'id, pierId, diseaseGrade, type, serial, [pierId+serial]',
+      steps: 'id, bridgeId, seq, state, syncRequirement, [bridgeId+seq]',
+      readings: 'id, stepId, pointCode, recordedAt, [stepId+pointCode]',
+      pendingReadings:
+        'id, importJobId, packageId, bridgeName, stepSeq, pointCode, status, conflictKey, [bridgeName+stepSeq+pointCode]',
+      offlineImports: 'id, packageId, status, updatedAt',
+      acceptances: 'id, bearingId, stage, conclusion, [bearingId+stage]',
+      settings: 'id',
+    }).upgrade(async (tx) => {
+      const tables: Array<Table<Record<string, unknown>, string>> = [
+        tx.table('bridges'),
+        tx.table('piers'),
+        tx.table('bearings'),
+        tx.table('steps'),
+        tx.table('readings'),
+        tx.table('acceptances'),
+      ];
+      for (const table of tables) {
+        await table.toCollection().modify((row: Record<string, unknown>) => {
+          row.revision = ROW_REVISION;
+        });
+      }
+      await tx.table('readings').toCollection().modify((row: Record<string, unknown>) => {
+        if (typeof row.stressMpa !== 'number') row.stressMpa = null;
+      });
+    });
   }
 }
 
@@ -372,7 +409,7 @@ export async function putBridge(row: BridgeRow): Promise<void> {
 export async function removeBridge(id: string): Promise<void> {
   await db.transaction(
     'rw',
-    [db.bridges, db.piers, db.bearings, db.steps, db.readings, db.acceptances],
+    [db.bridges, db.piers, db.bearings, db.steps, db.readings, db.pendingReadings, db.acceptances],
     async () => {
       const piers = await db.piers.where('bridgeId').equals(id).toArray();
       const pierIds = piers.map((item) => item.id);
@@ -382,6 +419,7 @@ export async function removeBridge(id: string): Promise<void> {
       const stepIds = stepRows.map((item) => item.id);
       if (bearingIds.length) await db.acceptances.where('bearingId').anyOf(bearingIds).delete();
       if (stepIds.length) await db.readings.where('stepId').anyOf(stepIds).delete();
+      if (stepIds.length) await db.pendingReadings.where('stepId').anyOf(stepIds).delete();
       await db.steps.where('bridgeId').equals(id).delete();
       if (pierIds.length) await db.bearings.where('pierId').anyOf(pierIds).delete();
       await db.piers.where('bridgeId').equals(id).delete();
@@ -447,8 +485,9 @@ export async function putSteps(rows: StepRow[]): Promise<void> {
 }
 
 export async function removeStep(id: string): Promise<void> {
-  await db.transaction('rw', [db.steps, db.readings], async () => {
+  await db.transaction('rw', [db.steps, db.readings, db.pendingReadings], async () => {
     await db.readings.where('stepId').equals(id).delete();
+    await db.pendingReadings.where('stepId').equals(id).delete();
     await db.steps.delete(id);
   });
 }
@@ -456,7 +495,18 @@ export async function removeStep(id: string): Promise<void> {
 /* ============================ 测点读数 ============================ */
 
 export async function listReadings(): Promise<ReadingRow[]> {
-  return db.readings.toArray();
+  const rows = (await db.readings.toArray()) as LegacyReadingRow[];
+  return rows.map((row) => normalizeReadingRow(row));
+}
+
+/** 兼容旧包：应力字段缺失或非法时按 0 读入，并保留原始字段给调用方补充备注。 */
+export function normalizeReadingRow(row: LegacyReadingRow): ReadingRow {
+  const stressMpa = typeof row.stressMpa === 'number' && Number.isFinite(row.stressMpa) ? row.stressMpa : 0;
+  return { ...row, stressMpa };
+}
+
+export function hasStressField(row: Pick<LegacyReadingRow, 'stressMpa'>): boolean {
+  return typeof row.stressMpa === 'number' && Number.isFinite(row.stressMpa);
 }
 
 export async function putReading(row: ReadingRow): Promise<void> {
@@ -469,6 +519,32 @@ export async function putReadings(rows: ReadingRow[]): Promise<void> {
 
 export async function removeReading(id: string): Promise<void> {
   await db.readings.delete(id);
+}
+
+/* ======================== 离线暂存读数 / 导入批次 ======================== */
+
+export async function listPendingReadings(): Promise<PendingReadingRow[]> {
+  return db.pendingReadings.toArray();
+}
+
+export async function putPendingReadings(rows: PendingReadingRow[]): Promise<void> {
+  await db.pendingReadings.bulkPut(rows);
+}
+
+export async function putPendingReading(row: PendingReadingRow): Promise<void> {
+  await db.pendingReadings.put(row);
+}
+
+export async function listOfflineImportJobs(): Promise<OfflineImportJobRow[]> {
+  return db.offlineImports.toArray();
+}
+
+export async function putOfflineImportJob(row: OfflineImportJobRow): Promise<void> {
+  await db.offlineImports.put(row);
+}
+
+export async function getOfflineImportJob(packageId: string): Promise<OfflineImportJobRow | undefined> {
+  return db.offlineImports.where('packageId').equals(packageId).first();
 }
 
 /* ============================= 验收 ============================= */
@@ -495,17 +571,21 @@ export interface DatabaseSnapshot {
   piers: Pier[];
   bearings: Bearing[];
   steps: Step[];
-  readings: Reading[];
+  readings: LegacyReadingRow[];
+  pendingReadings?: PendingReading[];
+  offlineImports?: OfflineImportJob[];
   acceptances: Acceptance[];
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [bridges, piers, bearings, steps, readings, acceptances] = await Promise.all([
+  const [bridges, piers, bearings, steps, readings, pendingReadings, offlineImports, acceptances] = await Promise.all([
     listBridges(),
     listPiers(),
     listBearings(),
     listSteps(),
     listReadings(),
+    listPendingReadings(),
+    listOfflineImportJobs(),
     listAcceptances(),
   ]);
   return {
@@ -517,6 +597,8 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     bearings,
     steps,
     readings,
+    pendingReadings,
+    offlineImports,
     acceptances,
   };
 }
@@ -524,7 +606,7 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
   await db.transaction(
     'rw',
-    [db.bridges, db.piers, db.bearings, db.steps, db.readings, db.acceptances],
+    [db.bridges, db.piers, db.bearings, db.steps, db.readings, db.pendingReadings, db.offlineImports, db.acceptances],
     async () => {
       await Promise.all([
         db.bridges.clear(),
@@ -532,13 +614,17 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
         db.bearings.clear(),
         db.steps.clear(),
         db.readings.clear(),
+        db.pendingReadings.clear(),
+        db.offlineImports.clear(),
         db.acceptances.clear(),
       ]);
       await db.bridges.bulkPut(snapshot.bridges ?? []);
       await db.piers.bulkPut(snapshot.piers ?? []);
       await db.bearings.bulkPut(snapshot.bearings ?? []);
       await db.steps.bulkPut(snapshot.steps ?? []);
-      await db.readings.bulkPut(snapshot.readings ?? []);
+      await db.readings.bulkPut((snapshot.readings ?? []).map((row) => normalizeReadingRow(row)));
+      await db.pendingReadings.bulkPut(snapshot.pendingReadings ?? []);
+      await db.offlineImports.bulkPut(snapshot.offlineImports ?? []);
       await db.acceptances.bulkPut(snapshot.acceptances ?? []);
     },
   );
@@ -548,7 +634,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
 export async function resetDatabase(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.bridges, db.piers, db.bearings, db.steps, db.readings, db.acceptances],
+    [db.bridges, db.piers, db.bearings, db.steps, db.readings, db.pendingReadings, db.offlineImports, db.acceptances],
     async () => {
       await Promise.all([
         db.bridges.clear(),
@@ -556,6 +642,8 @@ export async function resetDatabase(): Promise<void> {
         db.bearings.clear(),
         db.steps.clear(),
         db.readings.clear(),
+        db.pendingReadings.clear(),
+        db.offlineImports.clear(),
         db.acceptances.clear(),
       ]);
     },
@@ -565,15 +653,17 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [bridges, piers, bearings, steps, readings, acceptances] = await Promise.all([
+  const [bridges, piers, bearings, steps, readings, pendingReadings, offlineImports, acceptances] = await Promise.all([
     db.bridges.count(),
     db.piers.count(),
     db.bearings.count(),
     db.steps.count(),
     db.readings.count(),
+    db.pendingReadings.count(),
+    db.offlineImports.count(),
     db.acceptances.count(),
   ]);
-  return { bridges, piers, bearings, steps, readings, acceptances };
+  return { bridges, piers, bearings, steps, readings, pendingReadings, offlineImports, acceptances };
 }
 
 /** 结构版本信息 */

@@ -65,8 +65,12 @@ export interface StepView extends Step {
   overLimit: boolean;
   /** 该步骤的测点读数条数 */
   readingCount: number;
-  /** 同步偏差（mm），无读数为 null */
+  /** 同步偏差（mm），无正式读数为 null */
   syncDeviationMm: number | null;
+  /** 最后一巡实测本步顶升量（mm） */
+  observedLiftMm: number | null;
+  /** 最后一巡实测累计顶升量（mm） */
+  observedCumulativeMm: number | null;
   /** 校验结论文案 */
   validation: string;
 }

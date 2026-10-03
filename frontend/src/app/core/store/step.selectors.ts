@@ -3,6 +3,7 @@ import type { StepStateSlice } from './step.reducer';
 import type { BridgeRow, ReadingRow, StepRow } from '../utils/db';
 import { SYNC_REQUIREMENT_LABEL, syncLayoutHint, type StepView } from '../types/step';
 import { meanDisplacement, syncDeviationMm } from '../types/reading';
+import { latestReadingRound } from '../utils/monitoring';
 import { syncLevel, type ToleranceLevel } from '../utils/tolerance';
 
 export const selectStepState = createFeatureSelector<StepStateSlice>('step');
@@ -29,36 +30,74 @@ export const selectActiveSteps = createSelector(
   (steps, bridgeId) => steps.filter((item) => !bridgeId || item.bridgeId === bridgeId).sort((a, b) => a.seq - b.seq),
 );
 
-/** 步骤视图：含累计顶升量、同步偏差与校验结论 */
+/** 步骤视图：按桥梁分别累计计划 / 实测顶升量，并用最后一巡正式读数计算同步偏差。 */
 export function buildStepViews(steps: StepRow[], readings: ReadingRow[], bridges: BridgeRow[]): StepView[] {
   const bridgeName = new Map(bridges.map((item) => [item.id, item.name]));
-  const ordered = [...steps].sort((a, b) => a.seq - b.seq);
-  let running = 0;
-  return ordered.map((step) => {
-    running += step.targetLiftMm;
-    const rows = readings.filter((item) => item.stepId === step.id);
-    const deviation = rows.length > 0 ? syncDeviationMm(rows) : null;
-    const cumulativeLiftMm = Number(running.toFixed(2));
-    const overLimit = cumulativeLiftMm > step.limitMm;
-    return {
+  const views: StepView[] = [];
+
+  for (const bridge of bridges) {
+    let plannedCumulative = 0;
+    let observedCumulative = 0;
+    const bridgeSteps = steps.filter((item) => item.bridgeId === bridge.id).sort((a, b) => a.seq - b.seq);
+    for (const step of bridgeSteps) {
+      plannedCumulative = Number((plannedCumulative + step.targetLiftMm).toFixed(3));
+      const round = latestReadingRound(step, readings);
+      const observed = round.length ? Number(meanDisplacement(round).toFixed(3)) : null;
+      if (observed !== null) observedCumulative = Number((observedCumulative + observed).toFixed(3));
+      const deviation = round.length ? Number(syncDeviationMm(round).toFixed(3)) : null;
+      const overLimit = plannedCumulative > step.limitMm;
+      views.push({
+        ...step,
+        bridgeName: bridge.name,
+        cumulativeLiftMm: plannedCumulative,
+        observedLiftMm: observed,
+        observedCumulativeMm: observed === null ? null : observedCumulative,
+        overLimit,
+        readingCount: readings.filter((item) => item.stepId === step.id).length,
+        syncDeviationMm: deviation,
+        validation: overLimit
+          ? `累计顶升量 ${plannedCumulativeMmText(plannedCumulative)} 超过限位 ${step.limitMm} mm`
+          : deviation !== null && syncLevel(deviation) === 'exceed'
+            ? `最后一巡同步偏差 ${deviation.toFixed(2)} mm 超允许值`
+            : '顶升参数与正式监测数据均在控制范围内',
+      });
+    }
+  }
+
+  for (const step of steps.filter((item) => !bridges.some((bridge) => bridge.id === item.bridgeId))) {
+    const round = latestReadingRound(step, readings);
+    views.push({
       ...step,
       bridgeName: bridgeName.get(step.bridgeId) ?? '未归属桥梁',
-      cumulativeLiftMm,
-      overLimit,
-      readingCount: rows.length,
-      syncDeviationMm: deviation,
-      validation: overLimit
-        ? `累计顶升量 ${cumulativeLiftMm} mm 超过限位 ${step.limitMm} mm`
-        : deviation !== null && syncLevel(deviation) === 'exceed'
-          ? `同步偏差 ${deviation.toFixed(2)} mm 超允许值`
-          : '顶升参数与监测数据均在控制范围内',
-    };
-  });
+      cumulativeLiftMm: step.targetLiftMm,
+      observedLiftMm: round.length ? meanDisplacement(round) : null,
+      observedCumulativeMm: round.length ? meanDisplacement(round) : null,
+      overLimit: false,
+      readingCount: readings.filter((item) => item.stepId === step.id).length,
+      syncDeviationMm: round.length ? syncDeviationMm(round) : null,
+      validation: '步骤未挂接到桥梁，请先核对桥梁数据',
+    });
+  }
+
+  return views;
 }
 
-/** 步骤统计：总级数、累计顶升量、就位数、超限数 */
+function plannedCumulativeMmText(value: number): string {
+  return value.toFixed(2);
+}
+
+/** 步骤统计：按桥梁分别累计，避免不同桥梁的步骤序号串计。 */
 export const selectStepStats = createSelector(selectSteps, selectReadings, (steps, readings) => {
-  const cumulative = steps.reduce((sum, item) => sum + item.targetLiftMm, 0);
+  const bridges = new Map<string, StepRow[]>();
+  for (const step of steps) {
+    const list = bridges.get(step.bridgeId) ?? [];
+    list.push(step);
+    bridges.set(step.bridgeId, list);
+  }
+  const cumulative = [...bridges.values()].reduce((sum, list) => {
+    const planned = list.reduce((total, step) => total + step.targetLiftMm, 0);
+    return sum + planned;
+  }, 0);
   return {
     total: steps.length,
     cumulativeMm: Number(cumulative.toFixed(2)),
@@ -70,12 +109,12 @@ export const selectStepStats = createSelector(selectSteps, selectReadings, (step
   };
 });
 
-/** 同步偏差等级（按步骤） */
+/** 同步偏差等级（按步骤最后一巡正式读数） */
 export const selectSyncLevels = createSelector(selectReadings, selectSteps, (readings, steps) => {
   const result: Record<string, ToleranceLevel> = {};
   for (const step of steps) {
-    const rows = readings.filter((item) => item.stepId === step.id);
-    result[step.id] = syncLevel(rows.length > 0 ? syncDeviationMm(rows) : 0);
+    const round = latestReadingRound(step, readings);
+    result[step.id] = syncLevel(round.length ? syncDeviationMm(round) : 0);
   }
   return result;
 });
@@ -90,11 +129,11 @@ export const selectSyncHints = createSelector(selectSteps, (steps) =>
   })),
 );
 
-/** 各步骤平均位移（测点页展示） */
+/** 各步骤最后一巡平均位移（测点页展示） */
 export const selectStepAverages = createSelector(selectReadings, selectSteps, (readings, steps) => {
   const result: Record<string, number> = {};
   for (const step of steps) {
-    result[step.id] = meanDisplacement(readings.filter((item) => item.stepId === step.id));
+    result[step.id] = meanDisplacement(latestReadingRound(step, readings));
   }
   return result;
 });

@@ -36,7 +36,8 @@ export function limitLevel(displacementMm: number, limitMm: number): ToleranceLe
 }
 
 /** 应力等级判定 */
-export function stressLevel(stressMpa: number): ToleranceLevel {
+export function stressLevel(stressMpa: number | null | undefined): ToleranceLevel {
+  if (stressMpa === null || stressMpa === undefined) return 'ok';
   if (stressMpa >= STRESS_TOLERANCE_MPA) return 'exceed';
   if (stressMpa >= STRESS_TOLERANCE_MPA * 0.8) return 'watch';
   return 'ok';
@@ -60,7 +61,7 @@ export const TOLERANCE_COLOR: Record<ToleranceLevel, 'primary' | 'accent' | 'war
 export function overallLevel(
   displacementMm: number,
   limitMm: number,
-  stressMpa: number,
+  stressMpa: number | null | undefined,
 ): ToleranceLevel {
   const levels: ToleranceLevel[] = [limitLevel(displacementMm, limitMm), stressLevel(stressMpa)];
   if (levels.includes('exceed')) return 'exceed';
@@ -86,7 +87,7 @@ export function syncAlertText(deviationMm: number, requirement: string): string 
 }
 
 /** 超限读数统计 */
-export function countExceed<T extends { displacementMm: number; stressMpa: number }>(
+export function countExceed<T extends { displacementMm: number; stressMpa: number | null }>(
   rows: T[],
   limitMm: number,
 ): { exceed: number; watch: number; ok: number } {

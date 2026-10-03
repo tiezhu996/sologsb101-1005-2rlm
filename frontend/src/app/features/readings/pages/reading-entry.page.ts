@@ -41,6 +41,7 @@ import { StatBadgeComponent } from '../../../shared/components/common/stat-badge
 import { EmptyPanelComponent } from '../../../shared/components/common/empty-panel.component';
 import { FilterBarComponent, type FilterSelectSpec } from '../../../shared/components/common/filter-bar.component';
 import type { BridgeRow, StepRow } from '../../../core/utils/db';
+import { latestReadingRound } from '../../../core/utils/monitoring';
 import type { ToleranceLevel } from '../../../core/utils/tolerance';
 
 /** 批量录入的临时行 */
@@ -78,7 +79,7 @@ interface BatchRow {
       <div>
         <h2 class="page-title">测点读数录入</h2>
         <div class="page-sub">
-          选择顶升步骤后批量录入多测点位移与应力，实时计算同步偏差并按限位值给出告警。
+          选择顶升步骤后批量录入多测点位移与应力；离线平板包在“分步验收与归档”逐项确认后进入正式读数，本页按最后一巡正式读数重算同步偏差与告警。
         </div>
       </div>
       <div class="gb-inline-actions">
@@ -389,6 +390,7 @@ export class ReadingEntryPage {
         );
         const average = meanDisplacement(sameRound);
         const limitMm = step?.limitMm ?? 0;
+        const stressKnown = typeof reading.stressMpa === 'number';
         return {
           ...reading,
           stepSeq: step?.seq ?? 0,
@@ -397,7 +399,7 @@ export class ReadingEntryPage {
           syncRequirement: step ? SYNC_REQUIREMENT_LABEL[step.syncRequirement] : '-',
           deviationMm: Number((reading.displacementMm - average).toFixed(3)),
           overLimit: limitMm > 0 && Math.abs(reading.displacementMm) >= limitMm,
-          stressAlert: reading.stressMpa >= STRESS_ALERT_MPA,
+          stressAlert: stressKnown && reading.stressMpa >= STRESS_ALERT_MPA,
         };
       })
       .sort((a, b) => (a.stepSeq === b.stepSeq ? b.recordedAt.localeCompare(a.recordedAt) : a.stepSeq - b.stepSeq));
@@ -422,18 +424,24 @@ export class ReadingEntryPage {
   readonly currentAverage = computed(() => {
     const step = this.selectedStep();
     if (!step) return 0;
-    return meanDisplacement(this.readings().filter((item) => item.stepId === step.id));
+    return meanDisplacement(latestReadingRound(step, this.readings()));
   });
 
   readonly currentDeviation = computed(() => {
     const step = this.selectedStep();
     if (!step) return 0;
-    return syncDeviationMm(this.readings().filter((item) => item.stepId === step.id));
+    return syncDeviationMm(latestReadingRound(step, this.readings()));
   });
 
-  readonly exceedCount = computed(() =>
-    this.readingViews().filter((reading) => reading.overLimit || reading.stressAlert).length,
-  );
+  readonly exceedCount = computed(() => {
+    const latestIds = new Set(
+      this.stepViews()
+        .flatMap((step) => latestReadingRound(step, this.readings()).map((reading) => reading.id)),
+    );
+    return this.readingViews()
+      .filter((reading) => latestIds.has(reading.id))
+      .filter((reading) => reading.overLimit || reading.stressAlert).length;
+  });
 
   readonly batchAverage = computed(() => meanDisplacement(this.batchRows()));
   readonly batchDeviation = computed(() => syncDeviationMm(this.batchRows()));

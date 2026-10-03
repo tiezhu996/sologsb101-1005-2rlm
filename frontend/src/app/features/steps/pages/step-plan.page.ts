@@ -255,7 +255,10 @@ export class StepDialogComponent {
                 <td>{{ step.bridgeName }}</td>
                 <td>{{ formatLift(step.targetLiftMm) }}</td>
                 <td [style.color]="step.overLimit ? '#c62828' : '#16222e'">
-                  {{ step.cumulativeLiftMm }} mm
+                  计划 {{ step.cumulativeLiftMm }} mm
+                  @if (step.observedCumulativeMm !== null) {
+                    <div class="gb-hint">实测 {{ step.observedCumulativeMm }} mm</div>
+                  }
                 </td>
                 <td>{{ step.limitMm }} mm</td>
                 <td [matTooltip]="syncHintOf(step)">{{ syncRequirementLabel[step.syncRequirement] }}</td>
